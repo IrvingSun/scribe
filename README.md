@@ -39,6 +39,9 @@ Create a candidate (normally Claude does this itself):
   --future-use '...' --project "$PWD"
 ```
 
+`--project` is required. Use the project root for project facts and project decisions;
+use `@global` only for a cross-project preference or decision.
+
 Review candidates and sample approved cards:
 
 ```bash

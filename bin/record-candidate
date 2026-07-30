@@ -19,8 +19,8 @@ allowed_types = {
     "project_fact", "decision", "preference", "correction",
     "decision_change", "fact_supersession",
 }
-required = {"type", "claim", "evidence", "scope", "not-covered", "invalidated-by", "future-use"}
-allowed_keys = required | {"project", "replaces", "new-statement"}
+required = {"type", "claim", "evidence", "scope", "not-covered", "invalidated-by", "future-use", "project"}
+allowed_keys = required | {"replaces", "new-statement"}
 values = {}
 i = 0
 while i < len(args):
@@ -47,10 +47,15 @@ if values["type"] == "decision_change":
         raise SystemExit("decision_change requires: " + ", ".join(extra))
 if values["type"] == "fact_supersession" and not values.get("replaces", "").strip():
     raise SystemExit("fact_supersession requires: replaces")
+if values["type"] in {"project_fact", "fact_supersession"} and values["project"] == "@global":
+    raise SystemExit("fact cards require a project path, not @global")
 if values["type"] in {"decision_change", "fact_supersession"}:
     replaced = data_dir / "approved" / f"{values['replaces']}.md"
     if not replaced.is_file():
         raise SystemExit("replaces must name an active approved card: " + values["replaces"])
+    old_project = next((line[6:] for line in replaced.read_text(encoding="utf-8").splitlines() if line.startswith("- 项目: ")), "")
+    if old_project and old_project != values["project"]:
+        raise SystemExit("replacement must keep the replaced card's project scope")
 
 evidence = values["evidence"]
 if values["type"] in {"project_fact", "fact_supersession"}:

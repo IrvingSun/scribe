@@ -37,7 +37,7 @@ try:
     payload = json.loads(os.environ.get("SCRIBE_HOOK_INPUT", "{}"))
 except Exception:
     payload = {}
-cwd = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR")
+cwd = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
 if not cwd:
     raise SystemExit(0)
 

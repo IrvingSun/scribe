@@ -19,7 +19,7 @@ EOF
 
 update_settings() {
   local mode="$1"
-  python3 - "$SETTINGS" "$SCRIBE_ROOT" "$mode" <<'PY'
+  python3 - "$SETTINGS" "$SCRIBE_ROOT" "$SCRIBE_DATA_DIR" "$mode" <<'PY'
 import datetime as dt
 import json
 import pathlib
@@ -28,7 +28,9 @@ import sys
 
 settings_path = pathlib.Path(sys.argv[1])
 root = pathlib.Path(sys.argv[2])
-mode = sys.argv[3]
+data_dir = pathlib.Path(sys.argv[3])
+mode = sys.argv[4]
+state_path = data_dir / "install-state.json"
 settings_path.parent.mkdir(parents=True, exist_ok=True)
 if settings_path.exists():
     data = json.loads(settings_path.read_text(encoding="utf-8"))
@@ -45,20 +47,25 @@ denies = {
     "Read(~/.claude/projects/**/memory/**)",
 }
 
-def is_scribe_command(command):
-    return isinstance(command, str) and command.endswith((
-        "/scribe/hooks/session-start.sh", "/scribe/hooks/post-tool.sh",
-    ))
+try:
+    previous = json.loads(state_path.read_text(encoding="utf-8"))
+except (FileNotFoundError, json.JSONDecodeError):
+    previous = {}
 
-def is_scribe_permission(item):
-    return isinstance(item, str) and "/scribe/bin/record-candidate:*" in item
+# On first installation, remove the current checkout's legacy trace hook too.
+# Later installs/uninstalls only touch paths explicitly recorded by Scribe.
+known_commands = set(previous.get("commands", [])) | {
+    session,
+    str(root / "hooks" / "post-tool.sh"),
+}
+known_permissions = set(previous.get("permissions", [])) | {record}
 
 hooks = data.setdefault("hooks", {})
 for event in ("SessionStart", "PostToolUse"):
     groups = hooks.get(event, [])
     cleaned = []
     for group in groups:
-        children = [h for h in group.get("hooks", []) if not is_scribe_command(h.get("command"))]
+        children = [h for h in group.get("hooks", []) if h.get("command") not in known_commands]
         if children:
             replacement = dict(group)
             replacement["hooks"] = children
@@ -70,7 +77,7 @@ for event in ("SessionStart", "PostToolUse"):
 
 permissions = data.setdefault("permissions", {})
 allow = permissions.setdefault("allow", [])
-allow = [item for item in allow if not is_scribe_permission(item)]
+allow = [item for item in allow if item not in known_permissions]
 permissions["allow"] = allow
 deny = permissions.setdefault("deny", [])
 deny = [item for item in deny if item not in denies]
@@ -80,6 +87,13 @@ if mode == "install":
     hooks.setdefault("SessionStart", []).append({"hooks": [{"type": "command", "command": session, "timeout": 5}]})
     permissions["allow"].append(record)
     permissions["deny"].extend(sorted(denies))
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({
+        "commands": [session, str(root / "hooks" / "post-tool.sh")],
+        "permissions": [record],
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+elif mode == "uninstall":
+    state_path.unlink(missing_ok=True)
 
 settings_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 PY
@@ -116,15 +130,15 @@ try:
     data = json.loads(p.read_text(encoding="utf-8"))
 except Exception:
     raise SystemExit(1)
-commands = {str(root / "hooks" / "session-start.sh")}
-found = {h.get("command") for groups in data.get("hooks", {}).values() for group in groups for h in group.get("hooks", [])}
+session = str(root / "hooks" / "session-start.sh")
+found = [h.get("command") for groups in data.get("hooks", {}).values() for group in groups for h in group.get("hooks", [])]
 record = f"Bash({root / 'bin' / 'record-candidate'}:*)"
 denies = {
     "Edit(~/.claude/scribe/**)",
     "Edit(~/.claude/projects/**/memory/**)",
     "Read(~/.claude/projects/**/memory/**)",
 }
-raise SystemExit(0 if commands <= found and record in data.get("permissions", {}).get("allow", []) and denies <= set(data.get("permissions", {}).get("deny", [])) else 1)
+raise SystemExit(0 if found.count(session) == 1 and record in data.get("permissions", {}).get("allow", []) and denies <= set(data.get("permissions", {}).get("deny", [])) else 1)
 PY
     then echo "OK Claude Code registration"; else echo "MISSING Claude Code registration"; status=1; fi
     exit "$status"

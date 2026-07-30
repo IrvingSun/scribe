@@ -43,7 +43,7 @@ case "${1:-}" in
     count=0
     for card in "$CANDIDATES"/*.md; do
       [ -e "$card" ] || break
-      sed -n '1,12p' "$card"
+      cat "$card"
       echo "---"
       count=$((count + 1))
       [ "$count" -ge 5 ] && break
@@ -53,12 +53,13 @@ case "${1:-}" in
     sample=0
     for card in "$APPROVED"/*.md; do
       [ -e "$card" ] || break
-      sed -n '1,12p' "$card"
+      cat "$card"
       echo "---"
       sample=$((sample + 1))
       [ "$sample" -ge 2 ] && break
     done
     [ "$sample" -eq 0 ] && echo "（尚无）"
+    :
     ;;
   show)
     [ -n "${2:-}" ] || { usage; exit 2; }
