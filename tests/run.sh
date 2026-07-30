@@ -147,6 +147,19 @@ EXACT=$(new_card --type project_fact --claim '子模块另一处配置在 other.
   --evidence 'sub/other.py:5 的定义' "${FACT[@]}" --project "$WORK/repo/sub" --scope-exact)
 file_has "--scope-exact 保留子目录范围" "$SCRIBE_DATA_DIR/candidates/$EXACT.md" "项目: $WORK/repo/sub$"
 
+# Superseding a --scope-exact card without repeating the flag hits the automatic lift and
+# then the scope check; the error has to name the flag rather than only print two paths.
+"$LEDGER" approve "$EXACT" >/dev/null 2>&1
+# Match wording unique to the scope-mismatch hint: the lift notice on stderr also mentions
+# --scope-exact, so a looser pattern would pass without the hint existing at all.
+expect_match "替代 --scope-exact 旧卡时错误提示指出该加 --scope-exact" "替代卡也必须加" \
+  "$RECORD" --type fact_supersession --claim '子模块配置已迁至 other2.py:9' \
+  --evidence 'sub/other2.py:9 的定义' "${FACT[@]}" --project "$WORK/repo/sub" --replaces "$EXACT"
+expect_rc "带 --scope-exact 时替代成功" 0 \
+  "$RECORD" --type fact_supersession --claim '子模块配置已迁至 other2.py:9' \
+  --evidence 'sub/other2.py:9 的定义' "${FACT[@]}" --project "$WORK/repo/sub" \
+  --replaces "$EXACT" --scope-exact
+
 # ---------------------------------------------------------------- dedup
 section "去重"
 PF=$(new_card --type project_fact --claim '结算入口在 pay.py:42' \

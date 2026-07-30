@@ -132,9 +132,22 @@ def check_replacement(new_type, new_project, old_card):
     allowed = REPLACEABLE.get(new_type)
     if allowed is None:
         return f"{new_type} cards may not replace another card"
-    if scope_key(old_card.get("project", "")) != scope_key(new_project):
-        return ("replacement must keep the replaced card's scope: "
-                f"{old_card.get('project', '?')} != {new_project}")
+    old_project = old_card.get("project", "")
+    if scope_key(old_project) != scope_key(new_project):
+        message = ("replacement must keep the replaced card's scope: "
+                   f"{old_project or '?'} != {new_project}")
+        # The likeliest cause: the replaced card was recorded with --scope-exact, and this
+        # one was lifted to the repository root. Say so instead of leaving the caller to
+        # infer it from a path comparison.
+        if old_project and old_project != GLOBAL and new_project != GLOBAL:
+            try:
+                pathlib.Path(old_project).relative_to(pathlib.Path(new_project))
+            except ValueError:
+                pass
+            else:
+                message += ("；被替代卡使用的是 --scope-exact 的子目录范围，"
+                            "替代卡也必须加 --scope-exact 才能保持范围一致")
+        return message
     if old_card.get("type", "") not in allowed:
         return (f"{new_type} may only replace {'/'.join(sorted(allowed))}, "
                 f"but {old_card['id']} is {old_card.get('type', '?')}")
