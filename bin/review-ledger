@@ -1,5 +1,5 @@
 #!/bin/bash
-# Human-facing review helper. Promotion is explicit and preserves every card.
+# Human-facing review helper. Only active approved cards participate in recall.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -7,25 +7,28 @@ source "$SCRIPT_DIR/../lib/common.sh"
 scribe_ensure_data_dir
 CANDIDATES="$SCRIBE_DATA_DIR/candidates"
 APPROVED="$SCRIBE_DATA_DIR/approved"
+RETIRED="$SCRIBE_DATA_DIR/retired"
 ARCHIVE="$SCRIBE_DATA_DIR/archive"
 
 usage() {
   cat <<'EOF'
 usage:
-  review-ledger review                 Show up to five candidates and sample two approved cards.
-  review-ledger show CARD_ID           Print a candidate, approved, or archived card.
-  review-ledger recall TERM...         Search approved cards by keywords; returns at most five.
-  review-ledger approve CARD_ID        Promote a reviewed candidate; preserves its original contents.
+  review-ledger review                 Show up to five candidates and sample two active cards.
+  review-ledger show CARD_ID           Print a candidate, active, retired, or archived card.
+  review-ledger recall TERM...         Search active cards by project, claim, and scope.
+  review-ledger approve CARD_ID        Promote a candidate; apply a valid replacement chain.
   review-ledger archive CARD_ID        Archive a candidate without deleting it.
+  review-ledger retire CARD_ID REASON  Remove an active card from recall, preserving history.
+  review-ledger revoke CARD_ID REASON  Mark an active card incorrect and remove it from recall.
 
-Run approve/archive yourself only after reviewing the card. Claude may create candidates,
-but must not promote, archive, or rewrite approved memory without your explicit instruction.
+Run approve/archive/retire/revoke yourself only after review. Claude may create candidates,
+but must not promote, archive, or rewrite approved memory without explicit user instruction.
 EOF
 }
 
 find_card() {
   local card_id="$1"
-  for dir in "$CANDIDATES" "$APPROVED" "$ARCHIVE"; do
+  for dir in "$CANDIDATES" "$APPROVED" "$RETIRED" "$ARCHIVE"; do
     if [ -f "$dir/$card_id.md" ]; then
       printf '%s\n' "$dir/$card_id.md"
       return 0
@@ -46,7 +49,7 @@ case "${1:-}" in
       [ "$count" -ge 5 ] && break
     done
     [ "$count" -eq 0 ] && echo "（无）"
-    echo "已确认记忆抽审（最多 2 条）："
+    echo "active 已确认记忆抽审（最多 2 条）："
     sample=0
     for card in "$APPROVED"/*.md; do
       [ -e "$card" ] || break
@@ -64,29 +67,50 @@ case "${1:-}" in
     ;;
   recall)
     [ -n "${2:-}" ] || { usage; exit 2; }
-    echo "匹配的已确认记忆（最多 5 条；仍须核验当前一手证据）："
-    count=0
-    for card in "$APPROVED"/*.md; do
-      [ -e "$card" ] || break
-      matched=true
-      for term in "${@:2}"; do
-        grep -qiF -- "$term" "$card" || { matched=false; break; }
-      done
-      [ "$matched" = true ] || continue
-      sed -n '1,16p' "$card"
-      echo "---"
-      count=$((count + 1))
-      [ "$count" -ge 5 ] && break
-    done
-    [ "$count" -eq 0 ] && echo "（无匹配）"
+    python3 - "$APPROVED" "${@:2}" <<'PY'
+import pathlib, sys
+
+directory = pathlib.Path(sys.argv[1])
+terms = [term.casefold() for term in sys.argv[2:]]
+matches = []
+for card in directory.glob("*.md"):
+    lines = card.read_text(encoding="utf-8").splitlines()
+    values = []
+    for line in lines:
+        if line.startswith(("- 项目: ", "- 主张: ", "- 适用范围: ")):
+            values.append(line.split(": ", 1)[1])
+    haystack = "\n".join(values).casefold()
+    if all(term in haystack for term in terms):
+        score = sum(haystack.count(term) for term in terms)
+        created = next((line[8:] for line in lines if line.startswith("- 创建时间: ")), "")
+        matches.append((-score, created, lines))
+matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+print("匹配的 active 已确认记忆（最多 5 条；仍须核验当前一手证据）：")
+for _, _, lines in matches[:5]:
+    print("\n".join(lines[:16]))
+    print("---")
+if not matches:
+    print("（无匹配）")
+elif len(matches) > 5:
+    print(f"另有 {len(matches) - 5} 条未显示。")
+PY
     ;;
   approve)
     [ -n "${2:-}" ] || { usage; exit 2; }
     source="$CANDIDATES/$2.md"
     [ -f "$source" ] || { echo "候选不存在: $2" >&2; exit 1; }
+    replaced=$(sed -n 's/^- 替代\/复核的旧记录: //p' "$source" | head -1)
+    if [ -n "$replaced" ] && [ ! -f "$APPROVED/$replaced.md" ]; then
+      echo "替代目标不是 active approved 卡: $replaced" >&2
+      exit 1
+    fi
     approved_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    { sed 's/^- 状态: candidate$/- 状态: approved/' "$source"; echo "- 审核时间: $approved_at"; } > "$APPROVED/$2.md"
+    { sed 's/^- 状态: candidate$/- 状态: active/' "$source"; echo "- 审核时间: $approved_at"; [ -n "$replaced" ] && echo "- 替代来源: $replaced"; } > "$APPROVED/$2.md"
     mv "$source" "$ARCHIVE/$2.candidate.md"
+    if [ -n "$replaced" ]; then
+      { sed 's/^- 状态: active$/- 状态: superseded/'; echo "- 被替代者: $2"; echo "- 被替代时间: $approved_at"; } < "$APPROVED/$replaced.md" > "$RETIRED/$replaced.md"
+      rm "$APPROVED/$replaced.md"
+    fi
     echo "已确认: $2（原候选已移入 archive）"
     ;;
   archive)
@@ -95,6 +119,15 @@ case "${1:-}" in
     [ -f "$source" ] || { echo "候选不存在: $2" >&2; exit 1; }
     mv "$source" "$ARCHIVE/$2.md"
     echo "已归档: $2"
+    ;;
+  retire|revoke)
+    [ -n "${2:-}" ] && [ -n "${3:-}" ] || { usage; exit 2; }
+    source="$APPROVED/$2.md"
+    [ -f "$source" ] || { echo "active approved 卡不存在: $2" >&2; exit 1; }
+    at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    { sed "s/^- 状态: active$/- 状态: $1/" "$source"; echo "- ${1}时间: $at"; echo "- ${1}原因: $3"; } > "$RETIRED/$2.md"
+    rm "$source"
+    echo "已$1: $2"
     ;;
   *) usage; exit 2 ;;
 esac

@@ -13,16 +13,19 @@ cd ~/Documents/harness/scribe
 
 `install` is idempotent. It derives the code location, creates private mutable data at
 `~/.claude/scribe/`, initializes a local Git repository for that data, and registers only
-Scribe's Claude Code hooks and candidate-write permission. `uninstall` removes only those
-settings and preserves the data. `update` fast-forwards this checkout and re-runs install.
+Scribe's Claude Code hook, candidate-write permission, and Scribe-owned edit-deny rules.
+`uninstall` removes only those settings and preserves the data. `update` fast-forwards this
+checkout and re-runs install.
 
 ## v1 contract
 
 - Claude may create **candidate** cards only.
 - A candidate is not a fact. It must include evidence, scope, exclusions, invalidation conditions, and future use.
-- Only an explicit user review may promote or archive a card. Promotion preserves the original candidate in `ledger/archive/`.
+- Only an explicit user review may promote, archive, retire, revoke, or supersede a card. Promotion preserves the original candidate in `archive/`.
+- Only active cards are recalled. Superseded, retired, and revoked cards remain as historical evidence, never as active guidance.
 - Approved cards are investigation routes, never authority over current primary evidence or the user's latest explicit instruction.
 - A new user instruction immediately governs the active task. Persistent conflicts with an approved decision become a `decision_change` candidate; evidence that contradicts an approved fact becomes a `fact_supersession` candidate.
+- Scribe is the sole durable store for project facts and decisions. Native Claude Code project-memory files are protected from read and edit to prevent a second authority source.
 
 ## Commands
 
@@ -49,11 +52,13 @@ research route and re-check current primary evidence before relying on them:
 ./bin/review-ledger recall 订单 支付
 ```
 
-After your review, you may explicitly approve or archive one card:
+After your review, you may explicitly approve, archive, retire, or revoke one card:
 
 ```bash
 ./bin/review-ledger approve SCR-YYYYMMDD-XXXXXX
 ./bin/review-ledger archive SCR-YYYYMMDD-XXXXXX
+./bin/review-ledger retire SCR-YYYYMMDD-XXXXXX '不再适用的原因'
+./bin/review-ledger revoke SCR-YYYYMMDD-XXXXXX '确认错误的原因'
 ```
 
 ## Deferred deliberately

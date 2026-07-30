@@ -9,6 +9,7 @@ scribe_ensure_data_dir
 python3 - "$SCRIBE_DATA_DIR" "$@" <<'PY'
 import datetime as dt
 import pathlib
+import re
 import secrets
 import sys
 
@@ -19,6 +20,7 @@ allowed_types = {
     "decision_change", "fact_supersession",
 }
 required = {"type", "claim", "evidence", "scope", "not-covered", "invalidated-by", "future-use"}
+allowed_keys = required | {"project", "replaces", "new-statement"}
 values = {}
 i = 0
 while i < len(args):
@@ -28,17 +30,44 @@ while i < len(args):
     values[arg[2:]] = args[i + 1]
     i += 2
 
+unknown = sorted(set(values) - allowed_keys)
+if unknown:
+    raise SystemExit("unknown fields: " + ", ".join(unknown))
 missing = [key for key in required if not values.get(key, "").strip()]
 if missing:
     raise SystemExit("missing required fields: " + ", ".join(sorted(missing)))
 if values["type"] not in allowed_types:
     raise SystemExit("invalid type: " + values["type"])
+for key, value in values.items():
+    if "\n" in value or "\r" in value:
+        raise SystemExit(f"field must be one line: {key}")
 if values["type"] == "decision_change":
     extra = [key for key in ("replaces", "new-statement") if not values.get(key, "").strip()]
     if extra:
         raise SystemExit("decision_change requires: " + ", ".join(extra))
 if values["type"] == "fact_supersession" and not values.get("replaces", "").strip():
     raise SystemExit("fact_supersession requires: replaces")
+if values["type"] in {"decision_change", "fact_supersession"}:
+    replaced = data_dir / "approved" / f"{values['replaces']}.md"
+    if not replaced.is_file():
+        raise SystemExit("replaces must name an active approved card: " + values["replaces"])
+
+evidence = values["evidence"]
+if values["type"] in {"project_fact", "fact_supersession"}:
+    if not re.search(r"\S+:\d+|(?:命令|command|数据源|日志|log|查询|query)\s*[:：]", evidence, re.I):
+        raise SystemExit("fact evidence must include file:line, a command, or a named data source")
+elif not re.search(r"用户|user", evidence, re.I):
+    raise SystemExit("decision/preference evidence must identify the user statement")
+
+def normalized_claim(text):
+    return " ".join(text.casefold().split())
+
+claim = normalized_claim(values["claim"])
+for directory in (data_dir / "candidates", data_dir / "approved"):
+    for card in directory.glob("*.md"):
+        for line in card.read_text(encoding="utf-8").splitlines():
+            if line.startswith("- 主张: ") and normalized_claim(line[6:]) == claim:
+                raise SystemExit("duplicate claim already recorded: " + card.stem)
 
 now = dt.datetime.now(dt.timezone.utc)
 card_id = f"SCR-{now:%Y%m%d}-{secrets.token_hex(3).upper()}"

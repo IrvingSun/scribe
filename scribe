@@ -38,9 +38,12 @@ else:
     data = {}
 
 session = str(root / "hooks" / "session-start.sh")
-post = str(root / "hooks" / "post-tool.sh")
 record = f"Bash({root / 'bin' / 'record-candidate'}:*)"
-commands = {session, post}
+denies = {
+    "Edit(~/.claude/scribe/**)",
+    "Edit(~/.claude/projects/**/memory/**)",
+    "Read(~/.claude/projects/**/memory/**)",
+}
 
 def is_scribe_command(command):
     return isinstance(command, str) and command.endswith((
@@ -69,14 +72,14 @@ permissions = data.setdefault("permissions", {})
 allow = permissions.setdefault("allow", [])
 allow = [item for item in allow if not is_scribe_permission(item)]
 permissions["allow"] = allow
+deny = permissions.setdefault("deny", [])
+deny = [item for item in deny if item not in denies]
+permissions["deny"] = deny
 
 if mode == "install":
     hooks.setdefault("SessionStart", []).append({"hooks": [{"type": "command", "command": session, "timeout": 5}]})
-    hooks.setdefault("PostToolUse", []).append({
-        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
-        "hooks": [{"type": "command", "command": post, "timeout": 5}],
-    })
     permissions["allow"].append(record)
+    permissions["deny"].extend(sorted(denies))
 
 settings_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 PY
@@ -90,7 +93,6 @@ case "${1:-}" in
     ignore="$SCRIBE_DATA_DIR/.gitignore"
     touch "$ignore"
     grep -qxF '.DS_Store' "$ignore" || printf '.DS_Store\n' >> "$ignore"
-    grep -qxF 'trace/*.jsonl' "$ignore" || printf 'trace/*.jsonl\n' >> "$ignore"
     update_settings install
     echo "Scribe installed for Claude Code."
     echo "Code: $SCRIBE_ROOT"
@@ -103,7 +105,7 @@ case "${1:-}" in
     ;;
   doctor)
     status=0
-    for file in "$SCRIBE_ROOT/bin/record-candidate" "$SCRIBE_ROOT/bin/review-ledger" "$SCRIBE_ROOT/hooks/session-start.sh" "$SCRIBE_ROOT/hooks/post-tool.sh"; do
+    for file in "$SCRIBE_ROOT/bin/record-candidate" "$SCRIBE_ROOT/bin/review-ledger" "$SCRIBE_ROOT/hooks/session-start.sh"; do
       if [ -x "$file" ]; then echo "OK executable: $file"; else echo "MISSING executable: $file"; status=1; fi
     done
     if [ -d "$SCRIBE_DATA_DIR" ]; then echo "OK data: $SCRIBE_DATA_DIR"; else echo "MISSING data: $SCRIBE_DATA_DIR"; status=1; fi
@@ -114,10 +116,15 @@ try:
     data = json.loads(p.read_text(encoding="utf-8"))
 except Exception:
     raise SystemExit(1)
-commands = {str(root / "hooks" / "session-start.sh"), str(root / "hooks" / "post-tool.sh")}
+commands = {str(root / "hooks" / "session-start.sh")}
 found = {h.get("command") for groups in data.get("hooks", {}).values() for group in groups for h in group.get("hooks", [])}
 record = f"Bash({root / 'bin' / 'record-candidate'}:*)"
-raise SystemExit(0 if commands <= found and record in data.get("permissions", {}).get("allow", []) else 1)
+denies = {
+    "Edit(~/.claude/scribe/**)",
+    "Edit(~/.claude/projects/**/memory/**)",
+    "Read(~/.claude/projects/**/memory/**)",
+}
+raise SystemExit(0 if commands <= found and record in data.get("permissions", {}).get("allow", []) and denies <= set(data.get("permissions", {}).get("deny", [])) else 1)
 PY
     then echo "OK Claude Code registration"; else echo "MISSING Claude Code registration"; status=1; fi
     exit "$status"
