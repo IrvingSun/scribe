@@ -4,22 +4,30 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
-SETTINGS="$HOME/.claude/settings.json"
+scribe_require_python || exit 1
+# SCRIBE_SETTINGS and SCRIBE_DATA_DIR exist so install/doctor can be exercised against a
+# throwaway location. Deny rules are derived from the store actually in use, so an
+# overridden data directory is still protected.
+SETTINGS="${SCRIBE_SETTINGS:-$HOME/.claude/settings.json}"
+NATIVE_MEMORY="${SCRIBE_NATIVE_MEMORY:-$HOME/.claude/projects}"
 
 usage() {
   cat <<EOF
-usage: ./scribe <install|uninstall|doctor|update> [claude-code]
+usage: ./scribe <install|uninstall|doctor|update|migrate|snapshot> [args]
 
   install claude-code    Create the private data store and register Scribe hooks.
   uninstall claude-code  Remove only Scribe's Claude Code settings; preserve data.
-  doctor                 Check scripts, data store, and Claude Code registration.
+  doctor [--repair-check]  Check scripts, data store, and Claude Code registration.
+                         --repair-check also audits the ledger for broken state.
   update                 Fast-forward this Git checkout, then re-run install.
+  migrate [--apply]      Report (or copy in) legacy native project-memory files.
+  snapshot [MESSAGE]     Commit the current data store to its local Git repository.
 EOF
 }
 
 update_settings() {
   local mode="$1"
-  python3 - "$SETTINGS" "$SCRIBE_ROOT" "$SCRIBE_DATA_DIR" "$mode" <<'PY'
+  "$SCRIBE_PY" - "$SETTINGS" "$SCRIBE_ROOT" "$SCRIBE_DATA_DIR" "$mode" <<'PY'
 import datetime as dt
 import json
 import pathlib
@@ -31,34 +39,52 @@ root = pathlib.Path(sys.argv[2])
 data_dir = pathlib.Path(sys.argv[3])
 mode = sys.argv[4]
 state_path = data_dir / "install-state.json"
+backup_dir = data_dir / "backups"
+backup_dir.mkdir(parents=True, exist_ok=True)
 settings_path.parent.mkdir(parents=True, exist_ok=True)
+
+# Older versions dropped backups beside settings.json; give them a home and a bound.
+for stray in settings_path.parent.glob(settings_path.name + ".scribe-backup-*"):
+    shutil.move(str(stray), str(backup_dir / stray.name))
+
 if settings_path.exists():
     data = json.loads(settings_path.read_text(encoding="utf-8"))
-    backup = settings_path.with_name(settings_path.name + ".scribe-backup-" + dt.datetime.now().strftime("%Y%m%d%H%M%S"))
-    shutil.copy2(settings_path, backup)
+    stamp = dt.datetime.now().strftime("%Y%m%d%H%M%S")
+    shutil.copy2(settings_path, backup_dir / (settings_path.name + ".scribe-backup-" + stamp))
 else:
     data = {}
+for stale in sorted(backup_dir.glob(settings_path.name + ".scribe-backup-*"))[:-5]:
+    stale.unlink()
 
 session = str(root / "hooks" / "session-start.sh")
+ledger = root / "bin" / "review-ledger"
 record = f"Bash({root / 'bin' / 'record-candidate'}:*)"
+
+
+def home_relative(path):
+    """Deny rules must cover the store actually in use, not the default location."""
+    try:
+        return "~/" + str(path.relative_to(pathlib.Path.home()))
+    except ValueError:
+        return str(path)
+
+
+# Promotion is the user's act. Deny raises the floor from prompt-convention to rule;
+# it is not a hard boundary (any shell wrapper still reaches the script).
 denies = {
-    "Edit(~/.claude/scribe/**)",
+    f"Edit({home_relative(data_dir)}/**)",
     "Edit(~/.claude/projects/**/memory/**)",
     "Read(~/.claude/projects/**/memory/**)",
-}
+} | {f"Bash({ledger} {verb}:*)" for verb in ("approve", "archive", "retire", "revoke")}
 
 try:
     previous = json.loads(state_path.read_text(encoding="utf-8"))
 except (FileNotFoundError, json.JSONDecodeError):
     previous = {}
 
-# On first installation, remove the current checkout's legacy trace hook too.
-# Later installs/uninstalls only touch paths explicitly recorded by Scribe.
-known_commands = set(previous.get("commands", [])) | {
-    session,
-    str(root / "hooks" / "post-tool.sh"),
-}
+known_commands = set(previous.get("commands", [])) | {session}
 known_permissions = set(previous.get("permissions", [])) | {record}
+known_denies = set(previous.get("denies", [])) | denies
 
 hooks = data.setdefault("hooks", {})
 for event in ("SessionStart", "PostToolUse"):
@@ -76,12 +102,8 @@ for event in ("SessionStart", "PostToolUse"):
         hooks.pop(event, None)
 
 permissions = data.setdefault("permissions", {})
-allow = permissions.setdefault("allow", [])
-allow = [item for item in allow if item not in known_permissions]
-permissions["allow"] = allow
-deny = permissions.setdefault("deny", [])
-deny = [item for item in deny if item not in denies]
-permissions["deny"] = deny
+permissions["allow"] = [i for i in permissions.get("allow", []) if i not in known_permissions]
+permissions["deny"] = [i for i in permissions.get("deny", []) if i not in known_denies]
 
 if mode == "install":
     hooks.setdefault("SessionStart", []).append({"hooks": [{"type": "command", "command": session, "timeout": 5}]})
@@ -89,10 +111,18 @@ if mode == "install":
     permissions["deny"].extend(sorted(denies))
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps({
-        "commands": [session, str(root / "hooks" / "post-tool.sh")],
+        "commands": [session],
         "permissions": [record],
+        "denies": sorted(denies),
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 elif mode == "uninstall":
+    for key in ("allow", "deny"):
+        if not permissions.get(key):
+            permissions.pop(key, None)
+    if not permissions:
+        data.pop("permissions", None)
+    if not data.get("hooks"):
+        data.pop("hooks", None)
     state_path.unlink(missing_ok=True)
 
 settings_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -106,7 +136,27 @@ case "${1:-}" in
     [ -d "$SCRIBE_DATA_DIR/.git" ] || git -C "$SCRIBE_DATA_DIR" init >/dev/null
     ignore="$SCRIBE_DATA_DIR/.gitignore"
     touch "$ignore"
-    grep -qxF '.DS_Store' "$ignore" || printf '.DS_Store\n' >> "$ignore"
+    # backups/ holds verbatim copies of settings.json; imported/ holds legacy memory that
+    # has not been reviewed. Neither is ledger content, and neither should ever leave the
+    # machine if this repository is pushed.
+    for pattern in '.DS_Store' 'backups/' 'imported/'; do
+      grep -qxF "$pattern" "$ignore" || printf '%s\n' "$pattern" >> "$ignore"
+    done
+    # Untrack anything a previous snapshot already captured; files stay on disk.
+    if git -C "$SCRIBE_DATA_DIR" rev-parse HEAD >/dev/null 2>&1; then
+      tracked=$(git -C "$SCRIBE_DATA_DIR" ls-files -- backups imported | wc -l | tr -d ' ')
+      if [ "$tracked" -gt 0 ]; then
+        git -C "$SCRIBE_DATA_DIR" rm -r --cached --quiet -- backups imported
+        git -C "$SCRIBE_DATA_DIR" commit -m "scribe: stop tracking backups/ and imported/" >/dev/null
+        echo "已从数据仓索引移除 $tracked 个文件（backups/ 与 imported/，磁盘文件保留）。"
+      fi
+    fi
+    # A repository with no commits is not a safety net: give it a HEAD to diff against.
+    # Empty on purpose — never commit memory content the user has not chosen to commit,
+    # and never fight a global core.excludesFile over which files may be staged.
+    if ! git -C "$SCRIBE_DATA_DIR" rev-parse HEAD >/dev/null 2>&1; then
+      git -C "$SCRIBE_DATA_DIR" commit --allow-empty -m "scribe: baseline data store" >/dev/null
+    fi
     update_settings install
     echo "Scribe installed for Claude Code."
     echo "Code: $SCRIBE_ROOT"
@@ -122,30 +172,164 @@ case "${1:-}" in
     for file in "$SCRIBE_ROOT/bin/record-candidate" "$SCRIBE_ROOT/bin/review-ledger" "$SCRIBE_ROOT/hooks/session-start.sh"; do
       if [ -x "$file" ]; then echo "OK executable: $file"; else echo "MISSING executable: $file"; status=1; fi
     done
+    if [ -f "$SCRIBE_ROOT/lib/cards.py" ]; then echo "OK library: $SCRIBE_ROOT/lib/cards.py"; else echo "MISSING library: cards.py"; status=1; fi
     if [ -d "$SCRIBE_DATA_DIR" ]; then echo "OK data: $SCRIBE_DATA_DIR"; else echo "MISSING data: $SCRIBE_DATA_DIR"; status=1; fi
-    if python3 - "$SETTINGS" "$SCRIBE_ROOT" <<'PY'
+    if "$SCRIBE_PY" - "$SETTINGS" "$SCRIBE_ROOT" "$SCRIBE_DATA_DIR" <<'PY'
 import json, pathlib, sys
-p, root = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+p, root, data_dir = (pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]),
+                     pathlib.Path(sys.argv[3]))
 try:
     data = json.loads(p.read_text(encoding="utf-8"))
 except Exception:
     raise SystemExit(1)
 session = str(root / "hooks" / "session-start.sh")
-found = [h.get("command") for groups in data.get("hooks", {}).values() for group in groups for h in group.get("hooks", [])]
+ledger = root / "bin" / "review-ledger"
+# Only SessionStart counts: the same script registered under another event would
+# never fire as a session hook, and must not read as a healthy install.
+found = [h.get("command")
+         for group in data.get("hooks", {}).get("SessionStart", [])
+         for h in group.get("hooks", [])]
 record = f"Bash({root / 'bin' / 'record-candidate'}:*)"
+try:
+    store = "~/" + str(data_dir.relative_to(pathlib.Path.home()))
+except ValueError:
+    store = str(data_dir)
 denies = {
-    "Edit(~/.claude/scribe/**)",
+    f"Edit({store}/**)",
     "Edit(~/.claude/projects/**/memory/**)",
     "Read(~/.claude/projects/**/memory/**)",
-}
-raise SystemExit(0 if found.count(session) == 1 and record in data.get("permissions", {}).get("allow", []) and denies <= set(data.get("permissions", {}).get("deny", [])) else 1)
+} | {f"Bash({ledger} {verb}:*)" for verb in ("approve", "archive", "retire", "revoke")}
+ok = (found.count(session) == 1
+      and record in data.get("permissions", {}).get("allow", [])
+      and denies <= set(data.get("permissions", {}).get("deny", [])))
+raise SystemExit(0 if ok else 1)
 PY
     then echo "OK Claude Code registration"; else echo "MISSING Claude Code registration"; status=1; fi
+    pending=$(find "$SCRIBE_DATA_DIR/candidates" -maxdepth 1 -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' ' || true)
+    active=$(find "$SCRIBE_DATA_DIR/approved" -maxdepth 1 -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' ' || true)
+    echo "INFO cards: $active active, $pending pending review"
+    if git -C "$SCRIBE_DATA_DIR" rev-parse HEAD >/dev/null 2>&1; then
+      dirty=$(git -C "$SCRIBE_DATA_DIR" status --porcelain | wc -l | tr -d ' ')
+      echo "INFO data git: $(git -C "$SCRIBE_DATA_DIR" rev-list --count HEAD) commits, $dirty uncommitted change(s) — ./scribe snapshot"
+    else
+      echo "INFO data git: no commits yet — run ./scribe install or ./scribe snapshot"
+    fi
+    legacy=$(find "$NATIVE_MEMORY" -maxdepth 3 -path '*/memory/*' -type f 2>/dev/null | wc -l | tr -d ' ' || true)
+    [ "$legacy" -gt 0 ] && echo "INFO legacy native memory: $legacy file(s) — ./scribe migrate"
+    if [ "${2:-}" = "--repair-check" ]; then
+      "$SCRIBE_PY" - "$SCRIBE_DATA_DIR" <<'PY' || status=1
+import os
+import pathlib
+import sys
+from collections import Counter
+
+sys.path.insert(0, os.environ["SCRIBE_LIB_DIR"])
+import cards as cardlib
+
+data_dir = pathlib.Path(sys.argv[1])
+approved = cardlib.load_all(data_dir / "approved")
+retired = {card["id"]: card for card in cardlib.load_all(data_dir / "retired")}
+candidates = {card["id"]: card for card in cardlib.load_all(data_dir / "candidates")}
+problems = []
+
+# approve is several file operations; a crash in the middle leaves these shapes behind.
+for card in approved:
+    if card.get("status") != "active":
+        problems.append(f"{card['id']}: 在 approved/ 但状态是 {card.get('status', '缺失')}")
+    if card["id"] in candidates:
+        problems.append(f"{card['id']}: 同时存在于 approved/ 和 candidates/（批准中断）")
+    origin = card.get("superseded_from", "")
+    if origin and origin not in retired:
+        problems.append(f"{card['id']}: 替代来源 {origin} 不在 retired/（旧卡未退役）")
+    if origin and origin in {c["id"] for c in approved}:
+        problems.append(f"{card['id']}: 替代来源 {origin} 仍是 active（同一链上两张 active）")
+
+for origin, count in Counter(
+        card.get("superseded_from", "") for card in approved).items():
+    if origin and count > 1:
+        problems.append(f"{origin}: 被 {count} 张 active 卡同时声称替代（替代链分叉）")
+
+for card_id, card in retired.items():
+    if card.get("status") == "active":
+        problems.append(f"{card_id}: 在 retired/ 但状态仍是 active")
+
+if problems:
+    print(f"PROBLEM ledger: {len(problems)} 项异常")
+    for line in problems:
+        print(f"  - {line}")
+    raise SystemExit(1)
+print(f"OK ledger: {len(approved)} 张 active、{len(retired)} 张历史卡，未发现断裂")
+PY
+    fi
     exit "$status"
     ;;
   update)
     git -C "$SCRIBE_ROOT" pull --ff-only
     exec "$SCRIPT_DIR/scribe" install claude-code
+    ;;
+  migrate)
+    scribe_ensure_data_dir
+    "$SCRIBE_PY" - "$SCRIBE_DATA_DIR" "$NATIVE_MEMORY" "${2:-}" <<'PY'
+import pathlib
+import shutil
+import sys
+
+data_dir, projects, flag = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+if flag not in ("", "--apply"):
+    raise SystemExit("usage: ./scribe migrate [--apply]")
+apply = flag == "--apply"
+target_root = data_dir / "imported"
+
+found = sorted(p for p in projects.glob("*/memory/**/*") if p.is_file())
+if not found:
+    print("没有发现原生 project-memory 文件。")
+    raise SystemExit(0)
+
+copied = skipped = 0
+print(f"发现 {len(found)} 个原生 project-memory 文件"
+      + ("（复制到 imported/，原文件保留不动）：" if apply else "（预演，未改动任何文件）："))
+for path in found:
+    slug = path.relative_to(projects).parts[0]
+    rel = path.relative_to(projects / slug / "memory")
+    summary = ""
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("description:"):
+                summary = line.split(":", 1)[1].strip()
+                break
+    except (OSError, UnicodeDecodeError):
+        summary = "(无法读取为文本)"
+    target = target_root / slug / rel
+    state = ""
+    if apply:
+        # Never overwrite: imported/ is where the user annotates and triages.
+        if target.exists():
+            skipped += 1
+            state = "  [已存在，跳过]"
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+            copied += 1
+    print(f"- {slug}/{rel}  {path.stat().st_size}B  {summary}{state}")
+
+if apply:
+    print(f"\n已复制 {copied} 个，跳过 {skipped} 个已存在的 -> {target_root}")
+    print("原生文件未删除。下一步由你决定：逐条读过后，把仍然成立的内容用 record-candidate 立成候选，")
+    print("再自行 approve；不成立的直接忽略即可。")
+else:
+    print("\n这是预演。执行复制请加 --apply；migrate 从不删除原生文件。")
+PY
+    ;;
+  snapshot)
+    scribe_ensure_data_dir
+    [ -d "$SCRIBE_DATA_DIR/.git" ] || git -C "$SCRIBE_DATA_DIR" init >/dev/null
+    if [ -z "$(git -C "$SCRIBE_DATA_DIR" status --porcelain)" ]; then
+      echo "数据仓无变化，未提交。"
+    else
+      git -C "$SCRIBE_DATA_DIR" add -A
+      git -C "$SCRIBE_DATA_DIR" commit -m "${2:-scribe: snapshot}" >/dev/null
+      echo "已提交数据仓快照: $(git -C "$SCRIBE_DATA_DIR" rev-parse --short HEAD)"
+    fi
     ;;
   *) usage; exit 2 ;;
 esac

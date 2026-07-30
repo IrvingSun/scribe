@@ -4,6 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../lib/common.sh"
+scribe_require_python || exit 1
 scribe_ensure_data_dir
 CANDIDATES="$SCRIBE_DATA_DIR/candidates"
 APPROVED="$SCRIBE_DATA_DIR/approved"
@@ -13,14 +14,16 @@ ARCHIVE="$SCRIBE_DATA_DIR/archive"
 usage() {
   cat <<'EOF'
 usage:
-  review-ledger review                 Show up to five candidates and sample two active cards.
+  review-ledger review                 Show up to five candidates and rotate two active cards.
+  review-ledger list [--all]           List active cards in scope (--all: every project).
   review-ledger show CARD_ID           Print a candidate, active, retired, or archived card.
-  review-ledger recall TERM...         Search active cards by project, claim, and scope.
+  review-ledger recall [--all] TERM... Search active cards by project, claim, and scope.
   review-ledger approve CARD_ID        Promote a candidate; apply a valid replacement chain.
   review-ledger archive CARD_ID        Archive a candidate without deleting it.
   review-ledger retire CARD_ID REASON  Remove an active card from recall, preserving history.
   review-ledger revoke CARD_ID REASON  Mark an active card incorrect and remove it from recall.
 
+list/recall default to the current project plus @global cards; --all drops that filter.
 Run approve/archive/retire/revoke yourself only after review. Claude may create candidates,
 but must not promote, archive, or rewrite approved memory without explicit user instruction.
 EOF
@@ -29,106 +32,254 @@ EOF
 find_card() {
   local card_id="$1"
   for dir in "$CANDIDATES" "$APPROVED" "$RETIRED" "$ARCHIVE"; do
-    if [ -f "$dir/$card_id.md" ]; then
-      printf '%s\n' "$dir/$card_id.md"
-      return 0
-    fi
+    # archive/ keeps the pre-promotion snapshot as ID.candidate.md; it is still the card.
+    for name in "$card_id.md" "$card_id.candidate.md"; do
+      if [ -f "$dir/$name" ]; then
+        printf '%s\n' "$dir/$name"
+        return 0
+      fi
+    done
   done
   return 1
 }
 
 case "${1:-}" in
   review)
-    echo "待审核候选（最多 5 条）："
-    count=0
-    for card in "$CANDIDATES"/*.md; do
-      [ -e "$card" ] || break
-      cat "$card"
-      echo "---"
-      count=$((count + 1))
-      [ "$count" -ge 5 ] && break
-    done
-    [ "$count" -eq 0 ] && echo "（无）"
-    echo "active 已确认记忆抽审（最多 2 条）："
-    sample=0
-    for card in "$APPROVED"/*.md; do
-      [ -e "$card" ] || break
-      cat "$card"
-      echo "---"
-      sample=$((sample + 1))
-      [ "$sample" -ge 2 ] && break
-    done
-    [ "$sample" -eq 0 ] && echo "（尚无）"
-    :
+    # Oldest candidate first: filename order is random hex within a day, which would
+    # let some candidates sit behind newer ones forever.
+    "$SCRIBE_PY" - "$CANDIDATES" <<'PY'
+import os
+import sys
+
+sys.path.insert(0, os.environ["SCRIBE_LIB_DIR"])
+import cards as cardlib
+
+pending = cardlib.load_all(sys.argv[1])
+pending.sort(key=lambda card: (card.get("created", ""), card["id"]))
+print(f"待审核候选（共 {len(pending)} 条，最旧的最多 5 条）：")
+if not pending:
+    print("（无）")
+for card in pending[:5]:
+    print("\n".join(card["lines"]))
+    print("---")
+if len(pending) > 5:
+    print(f"另有 {len(pending) - 5} 条待审候选未显示。")
+PY
+    # Rotate the spot check: least-recently-sampled first, tracked outside the cards
+    # so audit records are never rewritten for bookkeeping.
+    "$SCRIBE_PY" - "$APPROVED" "$SCRIBE_DATA_DIR/review-state.json" <<'PY'
+import datetime as dt
+import json
+import os
+import pathlib
+import sys
+
+sys.path.insert(0, os.environ["SCRIBE_LIB_DIR"])
+import cards as cardlib
+
+approved, state_path = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+active = cardlib.load_all(approved)
+print("active 已确认记忆抽审（最多 2 条，按最久未抽审轮换）：")
+if not active:
+    print("（尚无）")
+    raise SystemExit(0)
+try:
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+except (FileNotFoundError, json.JSONDecodeError):
+    state = {}
+sampled = state.get("sampled", {})
+cursor = int(state.get("cursor", 0))
+# Order by a monotonic sequence, not by timestamp: two samples in the same second
+# would tie and the tiebreak would keep re-picking the same card.
+active.sort(key=lambda card: (sampled.get(card["id"], {}).get("seq", -1), card["id"]))
+now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+for card in active[:2]:
+    print("\n".join(card["lines"]))
+    print("---")
+    cursor += 1
+    sampled[card["id"]] = {"seq": cursor, "at": now}
+live = {card["id"] for card in active}
+state_path.write_text(
+    json.dumps({"cursor": cursor, "sampled": {k: v for k, v in sampled.items() if k in live}},
+               ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+    ;;
+  list|recall)
+    mode="$1"
+    shift
+    scope="scoped"
+    if [ "${1:-}" = "--all" ]; then scope="all"; shift; fi
+    if [ "$mode" = "recall" ] && [ -z "${1:-}" ]; then usage; exit 2; fi
+    "$SCRIBE_PY" - "$APPROVED" "$mode" "$scope" "$PWD" "$@" <<'PY'
+import os
+import pathlib
+import sys
+
+sys.path.insert(0, os.environ["SCRIBE_LIB_DIR"])
+import cards as cardlib
+
+approved, mode, scope, cwd = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+terms = [term.casefold() for term in sys.argv[5:]]
+try:
+    current = pathlib.Path(cwd).resolve()
+except OSError:
+    current = pathlib.Path(cwd)
+
+matched, out_of_scope = [], 0
+for card in cardlib.load_all(approved):
+    haystack = "\n".join(
+        card.get(key, "") for key in ("project", "claim", "scope")).casefold()
+    if terms and not all(term in haystack for term in terms):
+        continue
+    if scope != "all" and not cardlib.applies_to(card, current):
+        out_of_scope += 1
+        continue
+    score = sum(haystack.count(term) for term in terms)
+    matched.append((-score, card.get("created", ""), card))
+
+matched.sort(key=lambda item: item[1], reverse=True)  # newest first among ties
+matched.sort(key=lambda item: item[0])  # then strongest keyword match first
+limit = 5 if mode == "recall" else len(matched)
+header = "匹配的 active 已确认记忆" if mode == "recall" else "active 已确认记忆"
+suffix = "（最多 5 条；仍须核验当前一手证据）" if mode == "recall" else "（使用前须核验一手证据）"
+print(f"{header}{suffix}：")
+if not matched:
+    print("（无匹配）")
+for _, _, card in matched[:limit]:
+    if mode == "recall":
+        # Print the whole card: a fixed line budget silently drops fields added later.
+        print("\n".join(card["lines"]))
+        print("---")
+    else:
+        print(f"- {card['id']}  [{card.get('type', '?')}]  "
+              f"{cardlib.short_project(card)}  {card.get('claim', '')}")
+if len(matched) > limit:
+    print(f"另有 {len(matched) - limit} 条未显示。")
+if out_of_scope:
+    print(f"另有 {out_of_scope} 条其他项目的匹配未显示；加 --all 查看。")
+PY
     ;;
   show)
     [ -n "${2:-}" ] || { usage; exit 2; }
     path=$(find_card "$2") || { echo "找不到卡片: $2" >&2; exit 1; }
     cat "$path"
     ;;
-  recall)
-    [ -n "${2:-}" ] || { usage; exit 2; }
-    python3 - "$APPROVED" "${@:2}" <<'PY'
-import pathlib, sys
-
-directory = pathlib.Path(sys.argv[1])
-terms = [term.casefold() for term in sys.argv[2:]]
-matches = []
-for card in directory.glob("*.md"):
-    lines = card.read_text(encoding="utf-8").splitlines()
-    values = []
-    for line in lines:
-        if line.startswith(("- 项目: ", "- 主张: ", "- 适用范围: ")):
-            values.append(line.split(": ", 1)[1])
-    haystack = "\n".join(values).casefold()
-    if all(term in haystack for term in terms):
-        score = sum(haystack.count(term) for term in terms)
-        created = next((line[8:] for line in lines if line.startswith("- 创建时间: ")), "")
-        matches.append((-score, created, lines))
-matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
-print("匹配的 active 已确认记忆（最多 5 条；仍须核验当前一手证据）：")
-for _, _, lines in matches[:5]:
-    print("\n".join(lines[:16]))
-    print("---")
-if not matches:
-    print("（无匹配）")
-elif len(matches) > 5:
-    print(f"另有 {len(matches) - 5} 条未显示。")
-PY
-    ;;
   approve)
     [ -n "${2:-}" ] || { usage; exit 2; }
-    source="$CANDIDATES/$2.md"
-    [ -f "$source" ] || { echo "候选不存在: $2" >&2; exit 1; }
-    replaced=$(sed -n 's/^- 替代\/复核的旧记录: //p' "$source" | head -1)
-    if [ -n "$replaced" ] && [ ! -f "$APPROVED/$replaced.md" ]; then
-      echo "替代目标不是 active approved 卡: $replaced" >&2
-      exit 1
-    fi
-    approved_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    { sed 's/^- 状态: candidate$/- 状态: active/' "$source"; echo "- 审核时间: $approved_at"; [ -n "$replaced" ] && echo "- 替代来源: $replaced"; } > "$APPROVED/$2.md"
-    mv "$source" "$ARCHIVE/$2.candidate.md"
-    if [ -n "$replaced" ]; then
-      { sed 's/^- 状态: active$/- 状态: superseded/'; echo "- 被替代者: $2"; echo "- 被替代时间: $approved_at"; } < "$APPROVED/$replaced.md" > "$RETIRED/$replaced.md"
-      rm "$APPROVED/$replaced.md"
-    fi
-    echo "已确认: $2（原候选已移入 archive）"
+    "$SCRIBE_PY" - "$SCRIBE_DATA_DIR" "$2" <<'PY'
+import datetime as dt
+import os
+import pathlib
+import shutil
+import sys
+
+sys.path.insert(0, os.environ["SCRIBE_LIB_DIR"])
+import cards as cardlib
+
+data_dir, card_id = pathlib.Path(sys.argv[1]), sys.argv[2]
+source = data_dir / "candidates" / f"{card_id}.md"
+if not source.is_file():
+    raise SystemExit("候选不存在: " + card_id)
+
+card = cardlib.parse(source)
+replaced_id = card.get("replaces", "")
+replaced_path = data_dir / "approved" / f"{replaced_id}.md"
+if replaced_id:
+    if not replaced_path.is_file():
+        raise SystemExit("替代目标不是 active approved 卡: " + replaced_id)
+    # Re-check at promotion: the target may have been retired, revoked or itself
+    # superseded since the candidate was written.
+    problem = cardlib.check_replacement(
+        card.get("type", ""), card.get("project", ""), cardlib.parse(replaced_path))
+    if problem:
+        raise SystemExit(problem)
+
+now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+try:
+    lines = cardlib.replace_status(card["lines"], "candidate", "active")
+except ValueError as exc:
+    raise SystemExit(f"{card_id}: {exc}")
+lines.append(cardlib.field_line("approved_at", now))
+if replaced_id:
+    lines.append(cardlib.field_line("superseded_from", replaced_id))
+(data_dir / "approved" / f"{card_id}.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+shutil.move(str(source), str(data_dir / "archive" / f"{card_id}.candidate.md"))
+
+if replaced_id:
+    old = cardlib.parse(replaced_path)
+    try:
+        old_lines = cardlib.replace_status(old["lines"], "active", "superseded")
+    except ValueError as exc:
+        raise SystemExit(f"{replaced_id}: {exc}")
+    old_lines.append(cardlib.field_line("superseded_by", card_id))
+    old_lines.append(cardlib.field_line("superseded_at", now))
+    (data_dir / "retired" / f"{replaced_id}.md").write_text(
+        "\n".join(old_lines) + "\n", encoding="utf-8")
+    replaced_path.unlink()
+    print(f"已确认: {card_id}（原候选已移入 archive；{replaced_id} 转为 superseded）")
+else:
+    print(f"已确认: {card_id}（原候选已移入 archive）")
+PY
     ;;
   archive)
     [ -n "${2:-}" ] || { usage; exit 2; }
-    source="$CANDIDATES/$2.md"
-    [ -f "$source" ] || { echo "候选不存在: $2" >&2; exit 1; }
-    mv "$source" "$ARCHIVE/$2.md"
-    echo "已归档: $2"
+    "$SCRIBE_PY" - "$SCRIBE_DATA_DIR" "$2" <<'PY'
+import datetime as dt
+import os
+import pathlib
+import sys
+
+sys.path.insert(0, os.environ["SCRIBE_LIB_DIR"])
+import cards as cardlib
+
+data_dir, card_id = pathlib.Path(sys.argv[1]), sys.argv[2]
+source = data_dir / "candidates" / f"{card_id}.md"
+if not source.is_file():
+    raise SystemExit("候选不存在: " + card_id)
+
+# A rejected candidate becomes 'archived'. The pre-promotion snapshot written by
+# approve keeps 'candidate' on purpose: it records the card as it was reviewed.
+card = cardlib.parse(source)
+try:
+    lines = cardlib.replace_status(card["lines"], "candidate", "archived")
+except ValueError as exc:
+    raise SystemExit(f"{card_id}: {exc}")
+lines.append(cardlib.field_line(
+    "archived_at", dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")))
+(data_dir / "archive" / f"{card_id}.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+source.unlink()
+print(f"已归档: {card_id}（状态 archived）")
+PY
     ;;
   retire|revoke)
     [ -n "${2:-}" ] && [ -n "${3:-}" ] || { usage; exit 2; }
-    source="$APPROVED/$2.md"
-    [ -f "$source" ] || { echo "active approved 卡不存在: $2" >&2; exit 1; }
-    at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    { sed "s/^- 状态: active$/- 状态: $1/" "$source"; echo "- ${1}时间: $at"; echo "- ${1}原因: $3"; } > "$RETIRED/$2.md"
-    rm "$source"
-    echo "已$1: $2"
+    "$SCRIBE_PY" - "$SCRIBE_DATA_DIR" "$1" "$2" "$3" <<'PY'
+import datetime as dt
+import os
+import pathlib
+import sys
+
+sys.path.insert(0, os.environ["SCRIBE_LIB_DIR"])
+import cards as cardlib
+
+data_dir, action, card_id, reason = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+status = "retired" if action == "retire" else "revoked"
+source = data_dir / "approved" / f"{card_id}.md"
+if not source.is_file():
+    raise SystemExit("active approved 卡不存在: " + card_id)
+
+card = cardlib.parse(source)
+try:
+    lines = cardlib.replace_status(card["lines"], "active", status)
+except ValueError as exc:
+    raise SystemExit(f"{card_id}: {exc}")
+now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+lines.append(cardlib.field_line(f"{status}_at", now))
+lines.append(cardlib.field_line(f"{status}_reason", reason))
+(data_dir / "retired" / f"{card_id}.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+source.unlink()
+print(f"已{'停用' if status == 'retired' else '撤销'}: {card_id}（状态 {status}）")
+PY
     ;;
   *) usage; exit 2 ;;
 esac

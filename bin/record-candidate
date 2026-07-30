@@ -4,14 +4,20 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../lib/common.sh"
+scribe_require_python || exit 1
 scribe_ensure_data_dir
 
-python3 - "$SCRIBE_DATA_DIR" "$@" <<'PY'
+"$SCRIBE_PY" - "$SCRIBE_DATA_DIR" "$@" <<'PY'
 import datetime as dt
+import os
 import pathlib
 import re
 import secrets
+import subprocess
 import sys
+
+sys.path.insert(0, os.environ["SCRIBE_LIB_DIR"])
+import cards as cardlib
 
 data_dir = pathlib.Path(sys.argv[1])
 args = sys.argv[2:]
@@ -20,14 +26,25 @@ allowed_types = {
     "decision_change", "fact_supersession",
 }
 required = {"type", "claim", "evidence", "scope", "not-covered", "invalidated-by", "future-use", "project"}
-allowed_keys = required | {"replaces", "new-statement"}
+FLAGS = {"scope-exact"}
+allowed_keys = required | {"replaces", "new-statement"} | FLAGS
+USAGE = ("usage: record-candidate --type TYPE --claim TEXT --evidence TEXT --scope TEXT "
+         "--not-covered TEXT --invalidated-by TEXT --future-use TEXT --project PATH|@global "
+         "[--replaces CARD_ID] [--new-statement TEXT] [--scope-exact]")
 values = {}
 i = 0
 while i < len(args):
     arg = args[i]
-    if not arg.startswith("--") or i + 1 >= len(args):
-        raise SystemExit("usage: record-candidate --type TYPE --claim TEXT --evidence TEXT --scope TEXT --not-covered TEXT --invalidated-by TEXT --future-use TEXT [--project PATH] [--replaces CARD_ID] [--new-statement TEXT]")
-    values[arg[2:]] = args[i + 1]
+    if not arg.startswith("--"):
+        raise SystemExit(USAGE)
+    key = arg[2:]
+    if key in FLAGS:
+        values[key] = "1"
+        i += 1
+        continue
+    if i + 1 >= len(args):
+        raise SystemExit(USAGE)
+    values[key] = args[i + 1]
     i += 2
 
 unknown = sorted(set(values) - allowed_keys)
@@ -38,41 +55,138 @@ if missing:
     raise SystemExit("missing required fields: " + ", ".join(sorted(missing)))
 if values["type"] not in allowed_types:
     raise SystemExit("invalid type: " + values["type"])
+# Reject a replacement field the type cannot use, instead of writing a candidate that
+# only fails at approval time.
+if values.get("replaces", "").strip() and values["type"] not in cardlib.REPLACEABLE:
+    raise SystemExit("--replaces is only valid for "
+                     + "/".join(sorted(cardlib.REPLACEABLE)) + ", not " + values["type"])
+if values.get("new-statement", "").strip() and values["type"] != "decision_change":
+    raise SystemExit("--new-statement is only valid for decision_change, not " + values["type"])
 for key, value in values.items():
     if "\n" in value or "\r" in value:
         raise SystemExit(f"field must be one line: {key}")
+
+# A field that says nothing is worse than a missing field: it survives review by looking filled.
+PLACEHOLDERS = {
+    "无", "没有", "n/a", "na", "none", "null", "nil", "tbd", "todo", "待定", "待补",
+    "待确认", "未知", "unknown", "-", "--", "?", "？", "x", "xx", "xxx", "同上",
+}
+
+
+def is_placeholder(text):
+    stripped = text.strip().strip("。.；;，,").casefold()
+    return stripped in PLACEHOLDERS
+
+
+for key in sorted(required):
+    value = values[key].strip()
+    if is_placeholder(value):
+        raise SystemExit(f"field must carry content, not a placeholder: {key}")
+    # A low floor on purpose: CJK says a lot in two characters. The placeholder set
+    # above, not the length, is what catches a field that was filled to look filled.
+    if key != "type" and len(value) < 2:
+        raise SystemExit(f"field is too short to be reusable: {key}")
+
+def git_toplevel(path):
+    try:
+        done = subprocess.run(["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return pathlib.Path(done.stdout.strip()).resolve() if done.returncode == 0 else None
+
+
+if values["project"] != "@global":
+    root = pathlib.Path(values["project"]).expanduser()
+    if not root.is_absolute():
+        raise SystemExit("project must be an absolute path or @global: " + values["project"])
+    if not root.is_dir():
+        raise SystemExit("project path does not exist, the card would never surface: " + values["project"])
+    root = root.resolve()
+    # A card scoped to a subdirectory is invisible from the repository root — the session
+    # hook only injects cards whose project contains the cwd. Widening to the repository
+    # root is the safe direction: too broad shows an extra card, too narrow loses it
+    # silently. --scope-exact keeps the given path for genuinely package-local facts.
+    if not values.get("scope-exact"):
+        top = git_toplevel(root)
+        if top is not None and top != root:
+            print(f"提示: 项目范围已从 {root} 上提到仓库根 {top}"
+                  f"（子目录范围的卡在仓库根不会浮现；如确需按子目录限定，加 --scope-exact）",
+                  file=sys.stderr)
+            root = top
+    values["project"] = str(root)
 if values["type"] == "decision_change":
     extra = [key for key in ("replaces", "new-statement") if not values.get(key, "").strip()]
     if extra:
         raise SystemExit("decision_change requires: " + ", ".join(extra))
 if values["type"] == "fact_supersession" and not values.get("replaces", "").strip():
     raise SystemExit("fact_supersession requires: replaces")
-if values["type"] in {"project_fact", "fact_supersession"} and values["project"] == "@global":
-    raise SystemExit("fact cards require a project path, not @global")
+# @global is for guidance that travels across repositories. A fact is always about one
+# codebase, so facts and their supersessions must name a project.
+GLOBAL_TYPES = {"decision", "preference", "correction", "decision_change"}
+if values["project"] == "@global" and values["type"] not in GLOBAL_TYPES:
+    raise SystemExit(f"@global is limited to {'/'.join(sorted(GLOBAL_TYPES))}, not " + values["type"])
 if values["type"] in {"decision_change", "fact_supersession"}:
     replaced = data_dir / "approved" / f"{values['replaces']}.md"
     if not replaced.is_file():
         raise SystemExit("replaces must name an active approved card: " + values["replaces"])
-    old_project = next((line[6:] for line in replaced.read_text(encoding="utf-8").splitlines() if line.startswith("- 项目: ")), "")
-    if old_project and old_project != values["project"]:
-        raise SystemExit("replacement must keep the replaced card's project scope")
+    problem = cardlib.check_replacement(values["type"], values["project"], cardlib.parse(replaced))
+    if problem:
+        raise SystemExit(problem)
 
 evidence = values["evidence"]
 if values["type"] in {"project_fact", "fact_supersession"}:
-    if not re.search(r"\S+:\d+|(?:命令|command|数据源|日志|log|查询|query)\s*[:：]", evidence, re.I):
-        raise SystemExit("fact evidence must include file:line, a command, or a named data source")
+    # file:line, where the part before the colon contains a letter — otherwise a clock
+    # time ("每天 8:30 执行") satisfies the anchor and passes as a code reference.
+    has_location = any(re.search(r"[A-Za-z_一-鿿]", m.group(1))
+                       for m in re.finditer(r"([^\s:：]+)[:：](\d+)", evidence))
+    labelled = re.search(r"(?:命令|command|数据源|日志|log|查询|query)\s*[:：]\s*(?P<rest>.*)",
+                         evidence, re.I)
+    if not has_location and not labelled:
+        raise SystemExit("fact evidence must include file:line, a command, or a named data source: "
+                         + evidence)
+    if not has_location and labelled:
+        # A label with nothing behind it ("命令: 无") is not evidence.
+        rest = labelled.group("rest").strip()
+        if not rest or is_placeholder(rest) or len(rest) < 3:
+            raise SystemExit("fact evidence names a source but states nothing: " + evidence)
 elif not re.search(r"用户|user", evidence, re.I):
     raise SystemExit("decision/preference evidence must identify the user statement")
+
 
 def normalized_claim(text):
     return " ".join(text.casefold().split())
 
+
+def tokens(text):
+    return set(re.findall(r"[0-9a-z_./:\-]+|[一-鿿]", text.casefold()))
+
+
 claim = normalized_claim(values["claim"])
+claim_tokens = tokens(values["claim"])
+near = []
 for directory in (data_dir / "candidates", data_dir / "approved"):
-    for card in directory.glob("*.md"):
-        for line in card.read_text(encoding="utf-8").splitlines():
-            if line.startswith("- 主张: ") and normalized_claim(line[6:]) == claim:
-                raise SystemExit("duplicate claim already recorded: " + card.stem)
+    for card in cardlib.load_all(directory):
+        other = card.get("claim", "")
+        if not other:
+            continue
+        # Scope dedup to the same project: the same sentence can be a distinct fact
+        # in two repositories, and @global cards share no namespace with project cards.
+        if card.get("project", "") != values["project"]:
+            continue
+        if normalized_claim(other) == claim:
+            raise SystemExit("duplicate claim already recorded: " + card["id"])
+        other_tokens = tokens(other)
+        union = claim_tokens | other_tokens
+        if not union:
+            continue
+        overlap = len(claim_tokens & other_tokens) / len(union)
+        if overlap >= 0.8:
+            raise SystemExit(f"near-duplicate claim ({overlap:.0%} overlap) already recorded: " + card["id"])
+        if overlap >= 0.5:
+            near.append((overlap, card["id"], other))
+for overlap, card_id, other in sorted(near, reverse=True)[:3]:
+    print(f"提示: 与 {card_id} 有 {overlap:.0%} 重合 —— {other}", file=sys.stderr)
 
 now = dt.datetime.now(dt.timezone.utc)
 card_id = f"SCR-{now:%Y%m%d}-{secrets.token_hex(3).upper()}"
@@ -80,25 +194,14 @@ target = data_dir / "candidates"
 target.mkdir(parents=True, exist_ok=True)
 path = target / f"{card_id}.md"
 
-def field(name, label):
-    value = values.get(name, "").strip()
-    return f"- {label}: {value}\n" if value else ""
+# Labels come from cards.py so the writer and every reader share one vocabulary.
+written = {key.replace("-", "_"): value.strip() for key, value in values.items()}
+written["status"] = "candidate"
+written["created"] = now.isoformat()
 
-body = (
-    f"# {card_id}\n\n"
-    f"- 状态: candidate\n"
-    f"- 类型: {values['type']}\n"
-    f"- 创建时间: {now.isoformat()}\n"
-    + field("project", "项目")
-    + field("claim", "主张")
-    + field("evidence", "证据")
-    + field("scope", "适用范围")
-    + field("not-covered", "不涵盖")
-    + field("invalidated-by", "失效条件")
-    + field("future-use", "未来用途")
-    + field("replaces", "替代/复核的旧记录")
-    + field("new-statement", "用户最新表述")
-)
-path.write_text(body, encoding="utf-8")
+body = [f"# {card_id}", ""]
+body += [cardlib.field_line(key, written[key])
+         for key in cardlib.WRITE_ORDER if written.get(key)]
+path.write_text("\n".join(body) + "\n", encoding="utf-8")
 print(f"已写入候选记录: {card_id} ({path})")
 PY
