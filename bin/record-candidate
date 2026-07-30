@@ -1,0 +1,70 @@
+#!/bin/bash
+# Write a proposed memory card. This command never writes approved memory.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/common.sh"
+scribe_ensure_data_dir
+
+python3 - "$SCRIBE_DATA_DIR" "$@" <<'PY'
+import datetime as dt
+import pathlib
+import secrets
+import sys
+
+data_dir = pathlib.Path(sys.argv[1])
+args = sys.argv[2:]
+allowed_types = {
+    "project_fact", "decision", "preference", "correction",
+    "decision_change", "fact_supersession",
+}
+required = {"type", "claim", "evidence", "scope", "not-covered", "invalidated-by", "future-use"}
+values = {}
+i = 0
+while i < len(args):
+    arg = args[i]
+    if not arg.startswith("--") or i + 1 >= len(args):
+        raise SystemExit("usage: record-candidate --type TYPE --claim TEXT --evidence TEXT --scope TEXT --not-covered TEXT --invalidated-by TEXT --future-use TEXT [--project PATH] [--replaces CARD_ID] [--new-statement TEXT]")
+    values[arg[2:]] = args[i + 1]
+    i += 2
+
+missing = [key for key in required if not values.get(key, "").strip()]
+if missing:
+    raise SystemExit("missing required fields: " + ", ".join(sorted(missing)))
+if values["type"] not in allowed_types:
+    raise SystemExit("invalid type: " + values["type"])
+if values["type"] == "decision_change":
+    extra = [key for key in ("replaces", "new-statement") if not values.get(key, "").strip()]
+    if extra:
+        raise SystemExit("decision_change requires: " + ", ".join(extra))
+if values["type"] == "fact_supersession" and not values.get("replaces", "").strip():
+    raise SystemExit("fact_supersession requires: replaces")
+
+now = dt.datetime.now(dt.timezone.utc)
+card_id = f"SCR-{now:%Y%m%d}-{secrets.token_hex(3).upper()}"
+target = data_dir / "candidates"
+target.mkdir(parents=True, exist_ok=True)
+path = target / f"{card_id}.md"
+
+def field(name, label):
+    value = values.get(name, "").strip()
+    return f"- {label}: {value}\n" if value else ""
+
+body = (
+    f"# {card_id}\n\n"
+    f"- 状态: candidate\n"
+    f"- 类型: {values['type']}\n"
+    f"- 创建时间: {now.isoformat()}\n"
+    + field("project", "项目")
+    + field("claim", "主张")
+    + field("evidence", "证据")
+    + field("scope", "适用范围")
+    + field("not-covered", "不涵盖")
+    + field("invalidated-by", "失效条件")
+    + field("future-use", "未来用途")
+    + field("replaces", "替代/复核的旧记录")
+    + field("new-statement", "用户最新表述")
+)
+path.write_text(body, encoding="utf-8")
+print(f"已写入候选记录: {card_id} ({path})")
+PY

@@ -1,0 +1,130 @@
+#!/bin/bash
+# Standalone Scribe lifecycle command for Claude Code.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/common.sh"
+SETTINGS="$HOME/.claude/settings.json"
+
+usage() {
+  cat <<EOF
+usage: ./scribe <install|uninstall|doctor|update> [claude-code]
+
+  install claude-code    Create the private data store and register Scribe hooks.
+  uninstall claude-code  Remove only Scribe's Claude Code settings; preserve data.
+  doctor                 Check scripts, data store, and Claude Code registration.
+  update                 Fast-forward this Git checkout, then re-run install.
+EOF
+}
+
+update_settings() {
+  local mode="$1"
+  python3 - "$SETTINGS" "$SCRIBE_ROOT" "$mode" <<'PY'
+import datetime as dt
+import json
+import pathlib
+import shutil
+import sys
+
+settings_path = pathlib.Path(sys.argv[1])
+root = pathlib.Path(sys.argv[2])
+mode = sys.argv[3]
+settings_path.parent.mkdir(parents=True, exist_ok=True)
+if settings_path.exists():
+    data = json.loads(settings_path.read_text(encoding="utf-8"))
+    backup = settings_path.with_name(settings_path.name + ".scribe-backup-" + dt.datetime.now().strftime("%Y%m%d%H%M%S"))
+    shutil.copy2(settings_path, backup)
+else:
+    data = {}
+
+session = str(root / "hooks" / "session-start.sh")
+post = str(root / "hooks" / "post-tool.sh")
+record = f"Bash({root / 'bin' / 'record-candidate'}:*)"
+commands = {session, post}
+
+def is_scribe_command(command):
+    return isinstance(command, str) and command.endswith((
+        "/scribe/hooks/session-start.sh", "/scribe/hooks/post-tool.sh",
+    ))
+
+def is_scribe_permission(item):
+    return isinstance(item, str) and "/scribe/bin/record-candidate:*" in item
+
+hooks = data.setdefault("hooks", {})
+for event in ("SessionStart", "PostToolUse"):
+    groups = hooks.get(event, [])
+    cleaned = []
+    for group in groups:
+        children = [h for h in group.get("hooks", []) if not is_scribe_command(h.get("command"))]
+        if children:
+            replacement = dict(group)
+            replacement["hooks"] = children
+            cleaned.append(replacement)
+    if cleaned:
+        hooks[event] = cleaned
+    else:
+        hooks.pop(event, None)
+
+permissions = data.setdefault("permissions", {})
+allow = permissions.setdefault("allow", [])
+allow = [item for item in allow if not is_scribe_permission(item)]
+permissions["allow"] = allow
+
+if mode == "install":
+    hooks.setdefault("SessionStart", []).append({"hooks": [{"type": "command", "command": session, "timeout": 5}]})
+    hooks.setdefault("PostToolUse", []).append({
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [{"type": "command", "command": post, "timeout": 5}],
+    })
+    permissions["allow"].append(record)
+
+settings_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+case "${1:-}" in
+  install)
+    [ "${2:-claude-code}" = "claude-code" ] || { usage; exit 2; }
+    scribe_ensure_data_dir
+    [ -d "$SCRIBE_DATA_DIR/.git" ] || git -C "$SCRIBE_DATA_DIR" init >/dev/null
+    ignore="$SCRIBE_DATA_DIR/.gitignore"
+    touch "$ignore"
+    grep -qxF '.DS_Store' "$ignore" || printf '.DS_Store\n' >> "$ignore"
+    grep -qxF 'trace/*.jsonl' "$ignore" || printf 'trace/*.jsonl\n' >> "$ignore"
+    update_settings install
+    echo "Scribe installed for Claude Code."
+    echo "Code: $SCRIBE_ROOT"
+    echo "Data: $SCRIBE_DATA_DIR"
+    ;;
+  uninstall)
+    [ "${2:-claude-code}" = "claude-code" ] || { usage; exit 2; }
+    update_settings uninstall
+    echo "Scribe removed from Claude Code settings. Data preserved at: $SCRIBE_DATA_DIR"
+    ;;
+  doctor)
+    status=0
+    for file in "$SCRIBE_ROOT/bin/record-candidate" "$SCRIBE_ROOT/bin/review-ledger" "$SCRIBE_ROOT/hooks/session-start.sh" "$SCRIBE_ROOT/hooks/post-tool.sh"; do
+      if [ -x "$file" ]; then echo "OK executable: $file"; else echo "MISSING executable: $file"; status=1; fi
+    done
+    if [ -d "$SCRIBE_DATA_DIR" ]; then echo "OK data: $SCRIBE_DATA_DIR"; else echo "MISSING data: $SCRIBE_DATA_DIR"; status=1; fi
+    if python3 - "$SETTINGS" "$SCRIBE_ROOT" <<'PY'
+import json, pathlib, sys
+p, root = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+try:
+    data = json.loads(p.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+commands = {str(root / "hooks" / "session-start.sh"), str(root / "hooks" / "post-tool.sh")}
+found = {h.get("command") for groups in data.get("hooks", {}).values() for group in groups for h in group.get("hooks", [])}
+record = f"Bash({root / 'bin' / 'record-candidate'}:*)"
+raise SystemExit(0 if commands <= found and record in data.get("permissions", {}).get("allow", []) else 1)
+PY
+    then echo "OK Claude Code registration"; else echo "MISSING Claude Code registration"; status=1; fi
+    exit "$status"
+    ;;
+  update)
+    git -C "$SCRIBE_ROOT" pull --ff-only
+    exec "$SCRIPT_DIR/scribe" install claude-code
+    ;;
+  *) usage; exit 2 ;;
+esac

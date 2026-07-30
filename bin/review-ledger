@@ -1,0 +1,100 @@
+#!/bin/bash
+# Human-facing review helper. Promotion is explicit and preserves every card.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/common.sh"
+scribe_ensure_data_dir
+CANDIDATES="$SCRIBE_DATA_DIR/candidates"
+APPROVED="$SCRIBE_DATA_DIR/approved"
+ARCHIVE="$SCRIBE_DATA_DIR/archive"
+
+usage() {
+  cat <<'EOF'
+usage:
+  review-ledger review                 Show up to five candidates and sample two approved cards.
+  review-ledger show CARD_ID           Print a candidate, approved, or archived card.
+  review-ledger recall TERM...         Search approved cards by keywords; returns at most five.
+  review-ledger approve CARD_ID        Promote a reviewed candidate; preserves its original contents.
+  review-ledger archive CARD_ID        Archive a candidate without deleting it.
+
+Run approve/archive yourself only after reviewing the card. Claude may create candidates,
+but must not promote, archive, or rewrite approved memory without your explicit instruction.
+EOF
+}
+
+find_card() {
+  local card_id="$1"
+  for dir in "$CANDIDATES" "$APPROVED" "$ARCHIVE"; do
+    if [ -f "$dir/$card_id.md" ]; then
+      printf '%s\n' "$dir/$card_id.md"
+      return 0
+    fi
+  done
+  return 1
+}
+
+case "${1:-}" in
+  review)
+    echo "待审核候选（最多 5 条）："
+    count=0
+    for card in "$CANDIDATES"/*.md; do
+      [ -e "$card" ] || break
+      sed -n '1,12p' "$card"
+      echo "---"
+      count=$((count + 1))
+      [ "$count" -ge 5 ] && break
+    done
+    [ "$count" -eq 0 ] && echo "（无）"
+    echo "已确认记忆抽审（最多 2 条）："
+    sample=0
+    for card in "$APPROVED"/*.md; do
+      [ -e "$card" ] || break
+      sed -n '1,12p' "$card"
+      echo "---"
+      sample=$((sample + 1))
+      [ "$sample" -ge 2 ] && break
+    done
+    [ "$sample" -eq 0 ] && echo "（尚无）"
+    ;;
+  show)
+    [ -n "${2:-}" ] || { usage; exit 2; }
+    path=$(find_card "$2") || { echo "找不到卡片: $2" >&2; exit 1; }
+    cat "$path"
+    ;;
+  recall)
+    [ -n "${2:-}" ] || { usage; exit 2; }
+    echo "匹配的已确认记忆（最多 5 条；仍须核验当前一手证据）："
+    count=0
+    for card in "$APPROVED"/*.md; do
+      [ -e "$card" ] || break
+      matched=true
+      for term in "${@:2}"; do
+        grep -qiF -- "$term" "$card" || { matched=false; break; }
+      done
+      [ "$matched" = true ] || continue
+      sed -n '1,16p' "$card"
+      echo "---"
+      count=$((count + 1))
+      [ "$count" -ge 5 ] && break
+    done
+    [ "$count" -eq 0 ] && echo "（无匹配）"
+    ;;
+  approve)
+    [ -n "${2:-}" ] || { usage; exit 2; }
+    source="$CANDIDATES/$2.md"
+    [ -f "$source" ] || { echo "候选不存在: $2" >&2; exit 1; }
+    approved_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    { sed 's/^- 状态: candidate$/- 状态: approved/' "$source"; echo "- 审核时间: $approved_at"; } > "$APPROVED/$2.md"
+    mv "$source" "$ARCHIVE/$2.candidate.md"
+    echo "已确认: $2（原候选已移入 archive）"
+    ;;
+  archive)
+    [ -n "${2:-}" ] || { usage; exit 2; }
+    source="$CANDIDATES/$2.md"
+    [ -f "$source" ] || { echo "候选不存在: $2" >&2; exit 1; }
+    mv "$source" "$ARCHIVE/$2.md"
+    echo "已归档: $2"
+    ;;
+  *) usage; exit 2 ;;
+esac
